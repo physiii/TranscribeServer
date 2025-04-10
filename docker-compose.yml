@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  transcribe:
+    build: .
+    ports:
+      - "8123:8123"
+    volumes:
+      # Optional: Mount current directory for live code changes (dev only)
+      # - .:/app
+      # Mount a directory for model cache to persist between runs
+      - model_cache:/root/.cache/huggingface/hub
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      # Ensure faster-whisper uses GPU if available
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+volumes:
+  model_cache: 
