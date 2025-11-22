@@ -2,6 +2,7 @@ version: '3.8'
 
 services:
   transcribe:
+    restart: always
     build: .
     ports:
       - "8123:8123"
