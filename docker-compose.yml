@@ -16,12 +16,21 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              device_ids: ["1"]
               capabilities: [gpu]
     environment:
       # Ensure faster-whisper uses GPU if available
-      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_VISIBLE_DEVICES=1
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - TRANSCRIBE_WORKERS=4
+      - TRANSCRIBE_PORT=8123
+    command: >
+      uvicorn main:app
+      --host 0.0.0.0
+      --port ${TRANSCRIBE_PORT:-8123}
+      --workers ${TRANSCRIBE_WORKERS:-4}
+      --loop uvloop
+      --http httptools
 
 volumes:
   model_cache: 

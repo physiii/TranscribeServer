@@ -35,11 +35,15 @@ RUN pip install faster-whisper
 ARG TORCH_CUDA_ARCH_LIST="Pascal;Turing;Ampere;Ada;Hopper"
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Sensible defaults; override via docker-compose or environment
+ENV TRANSCRIBE_PORT=8123
+ENV TRANSCRIBE_WORKERS=4
+
 # Copy the application code
 COPY main.py .
 
 # Expose the port the app runs on
 EXPOSE 8123
 
-# Command to run the application using the default python (which is now 3.10)
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8123"]
+# Command to run multi-worker uvicorn with uvloop/httptools
+CMD ["/bin/sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${TRANSCRIBE_PORT:-8123} --workers ${TRANSCRIBE_WORKERS:-4} --loop uvloop --http httptools"]
