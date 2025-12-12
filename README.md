@@ -8,7 +8,7 @@ It is implemented as a FastAPI app served by Uvicorn inside Docker.
 
 ### Model and decoding defaults
 
-- **Model**: `faster-whisper` with the `large-v3` checkpoint.
+- **Model**: `faster-whisper` with the `medium.en` checkpoint (English-only).
 - **Device**: GPU if available (`cuda`), otherwise CPU.
 - **Sample rate**: audio is converted to **16 kHz mono** before transcription.
 - **Decoding defaults** (applied internally on every request):
@@ -119,11 +119,38 @@ curl -X POST "http://localhost:8123/" \
   -F "file=@/path/to/support_call.wav"
 ```
 
+#### `detailed` (optional)
+
+- **Type**: boolean (default: `false`)
+- **Purpose**: Control whether the API returns **only the transcription string** (simple mode) or a **richer JSON object** with metadata and segment information.
+  - When `false` (default), the response is:
+    - `{"transcription": "<full text>"}`
+  - When `true`, the response includes:
+    - language, language probability
+    - audio duration and pipeline information
+    - timing breakdown
+    - per-segment information (start/end/time/text, etc.)
+
+This is useful when clients want more insight into how the model decoded the audio, but do not need per-word details.
+
+#### `word_timestamps` (optional)
+
+- **Type**: boolean (default: `false`)
+- **Purpose**: If `true`, the server will:
+  - Ask `faster-whisper` for **word-level timestamps** (`word_timestamps=True`)
+  - Return **per-word start/end times and confidence scores** (probabilities) inside each segment.
+- **Behavior**:
+  - Setting `word_timestamps=true` **implicitly enables detailed mode**, so the response will be the rich JSON object described below.
+
+This is the flag to use if you want per-word confidences for alignment, highlighting, or karaoke-style playback.
+
 ---
 
 ### Response schema
 
-On success, the API returns:
+On success, the API returns one of two shapes depending on the query parameters:
+
+#### Simple response (default)
 
 ```json
 {
@@ -132,6 +159,91 @@ On success, the API returns:
 ```
 
 - **`transcription`**: the full transcribed text for the provided audio.
+
+This is the default when **both** `detailed=false` and `word_timestamps=false` (or when they are omitted).
+
+#### Detailed response (when `detailed=true` or `word_timestamps=true`)
+
+When `detailed=true` (or `word_timestamps=true`), the response includes extra metadata and a list of segments. Example:
+
+```json
+{
+  "transcription": "Thank you for watching.",
+  "language": "en",
+  "language_probability": 0.99,
+  "audio_seconds": 3.5,
+  "pipeline": "wav_direct",
+  "ffmpeg_used": false,
+  "timing": {
+    "total": 0.120,
+    "read": 0.005,
+    "wait": 0.000,
+    "process": 0.115,
+    "model": 0.110
+  },
+  "segments": [
+    {
+      "id": 0,
+      "start": 0.0,
+      "end": 1.2,
+      "text": "Thank you",
+      "avg_logprob": -0.05,
+      "no_speech_prob": 0.01,
+      "words": [
+        {
+          "start": 0.0,
+          "end": 0.5,
+          "word": "Thank",
+          "probability": 0.98
+        },
+        {
+          "start": 0.5,
+          "end": 1.2,
+          "word": "you",
+          "probability": 0.97
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "start": 1.2,
+      "end": 3.5,
+      "text": "for watching.",
+      "avg_logprob": -0.03,
+      "no_speech_prob": 0.02,
+      "words": [
+        {
+          "start": 1.2,
+          "end": 2.0,
+          "word": "for",
+          "probability": 0.99
+        },
+        {
+          "start": 2.0,
+          "end": 3.5,
+          "word": "watching.",
+          "probability": 0.98
+        }
+      ]
+    }
+  ]
+}
+```
+
+- **`language`** / **`language_probability`**: detected language and its probability from `faster-whisper`.
+- **`audio_seconds`**: duration of the (resampled) audio in seconds.
+- **`pipeline`**: which internal path was used (`raw_pcm`, `wav_direct`, `wav_ffmpeg`, or `other_ffmpeg`).
+- **`ffmpeg_used`**: whether ffmpeg was invoked for resampling/format conversion.
+- **`timing`**: high-level timing breakdown for the request.
+- **`segments`**: list of decoded segments:
+  - `id`, `start`, `end`, `text`, `avg_logprob`, `no_speech_prob`.
+  - If `word_timestamps=true`:
+    - Each segment includes `words`, a list of:
+      - `start`, `end`: word-level timestamps (seconds).
+      - `word`: the token/word as a string.
+      - `probability`: confidence-like score from `faster-whisper`.
+
+If `detailed=true` but `word_timestamps=false`, the schema is the same except that `words` is omitted from each segment.
 
 Any server-side logging (language detection, processing time, etc.) is written to stdout (Docker logs) and not included in the HTTP response.
 

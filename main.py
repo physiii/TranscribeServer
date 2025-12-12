@@ -22,13 +22,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger("transcribe")
 
-# GPU detection
-DEVICE_TYPE = "cuda" if torch.cuda.is_available() else "cpu"
-COMPUTE_TYPE = "float16" if DEVICE_TYPE == "cuda" else "float32"
+# GPU detection and pinning (require GPU)
+GPU_INDEX = int(os.getenv("TRANSCRIBE_GPU_ID", "0"))
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is not available but GPU execution is required.")
+torch.cuda.set_device(GPU_INDEX)
+DEVICE_TYPE = "cuda"
+COMPUTE_TYPE = "float16"
 
-# Load the Faster Whisper model once at startup
-# Switched from "medium.en" (English-only) to "large-v3" (most accurate Whisper checkpoint).
-model = WhisperModel("large-v3", device=DEVICE_TYPE, compute_type=COMPUTE_TYPE)
+# Load the Faster Whisper model once at startup, pinned to the chosen GPU.
+# Using "medium.en" (English-only, faster than large-v3).
+logger.info("Loading Whisper model on cuda:%d with compute_type=%s", GPU_INDEX, COMPUTE_TYPE)
+model = WhisperModel(
+    "medium.en",
+    device=DEVICE_TYPE,
+    device_index=GPU_INDEX,
+    compute_type=COMPUTE_TYPE,
+)
 
 app = FastAPI()
 
@@ -166,7 +176,8 @@ def _transcribe_audio(
     extra: dict,
     initial_prompt: Optional[str] = None,
     no_speech_threshold: Optional[float] = None,
-) -> Tuple[str, dict]:
+    word_timestamps: bool = False,
+) -> Tuple[str, dict, list]:
     """
     Core transcription helper. Applies our default decoding settings and
     passes optional per-request controls through to faster-whisper.
@@ -180,9 +191,14 @@ def _transcribe_audio(
         kwargs["initial_prompt"] = initial_prompt
     if no_speech_threshold is not None:
         kwargs["no_speech_threshold"] = no_speech_threshold
+    if word_timestamps:
+        kwargs["word_timestamps"] = True
 
+    # Materialize the generator so we can both build the full text and
+    # optionally return per-segment / per-word details.
     segments, info = model.transcribe(audio, **kwargs)
-    transcription = " ".join(seg.text for seg in segments).strip()
+    segments_list = list(segments)
+    transcription = " ".join(seg.text for seg in segments_list).strip()
     audio_seconds = len(audio) / 16000.0 if len(audio) else 0.0
     meta = {
         "pipeline": pipeline,
@@ -198,7 +214,7 @@ def _transcribe_audio(
         info.language_probability,
         audio_seconds,
     )
-    return transcription, meta
+    return transcription, meta, segments_list
 
 
 def _process_audio_bytes(
@@ -207,7 +223,8 @@ def _process_audio_bytes(
     filename: str,
     initial_prompt: Optional[str] = None,
     no_speech_threshold: Optional[float] = None,
-) -> Tuple[str, dict]:
+    word_timestamps: bool = False,
+) -> Tuple[str, dict, list]:
     """
     Heavy, blocking path: parse/convert audio and run WhisperModel.transcribe.
     This runs in a worker thread via asyncio.to_thread.
@@ -228,15 +245,16 @@ def _process_audio_bytes(
         "application/octet-stream" in ctype and fname.endswith(".raw")
     ):
         audio = np.frombuffer(data, dtype=np.float32).astype(np.float32)
-        transcription, meta = _transcribe_audio(
+        transcription, meta, segments = _transcribe_audio(
             audio,
             pipeline="raw_pcm",
             extra={**meta_extra, "ffmpeg": False},
             initial_prompt=initial_prompt,
             no_speech_threshold=no_speech_threshold,
+            word_timestamps=word_timestamps,
         )
         meta["process_time"] = time.perf_counter() - start
-        return transcription, meta
+        return transcription, meta, segments
 
     # 2) 16 kHz mono WAV path: TWIN already sends 16 kHz mono WAV -> skip ffmpeg
     if "audio/wav" in ctype or fname.endswith(".wav"):
@@ -248,39 +266,42 @@ def _process_audio_bytes(
             sr = None
 
         if audio is not None and sr == 16000:
-            transcription, meta = _transcribe_audio(
+            transcription, meta, segments = _transcribe_audio(
                 audio,
                 pipeline="wav_direct",
                 extra={**meta_extra, "channels": nch, "ffmpeg": False},
                 initial_prompt=initial_prompt,
                 no_speech_threshold=no_speech_threshold,
+                word_timestamps=word_timestamps,
             )
             meta["process_time"] = time.perf_counter() - start
-            return transcription, meta
+            return transcription, meta, segments
         else:
             # Not 16 kHz or failed to parse; fall back to ffmpeg resample
             audio = _run_ffmpeg_resample(data)
-            transcription, meta = _transcribe_audio(
+            transcription, meta, segments = _transcribe_audio(
                 audio,
                 pipeline="wav_ffmpeg",
                 extra={**meta_extra, "ffmpeg": True},
                 initial_prompt=initial_prompt,
                 no_speech_threshold=no_speech_threshold,
+                word_timestamps=word_timestamps,
             )
             meta["process_time"] = time.perf_counter() - start
-            return transcription, meta
+            return transcription, meta, segments
 
     # 3) Other formats (mp3, etc.): use ffmpeg then whisper
     audio = _run_ffmpeg_resample(data)
-    transcription, meta = _transcribe_audio(
+    transcription, meta, segments = _transcribe_audio(
         audio,
         pipeline="other_ffmpeg",
         extra={**meta_extra, "ffmpeg": True},
         initial_prompt=initial_prompt,
         no_speech_threshold=no_speech_threshold,
+        word_timestamps=word_timestamps,
     )
     meta["process_time"] = time.perf_counter() - start
-    return transcription, meta
+    return transcription, meta, segments
 
 
 @app.post("/")
@@ -295,6 +316,20 @@ async def transcribe(
         description=(
             "Optional override for faster-whisper's no_speech_threshold. "
             "Higher values make the model more likely to treat segments as silence."
+        ),
+    ),
+    detailed: bool = Query(
+        default=False,
+        description=(
+            "If true, return detailed metadata including segments and timing instead "
+            "of just a flat transcription string."
+        ),
+    ),
+    word_timestamps: bool = Query(
+        default=False,
+        description=(
+            "If true, include per-word timestamps and confidence scores (probabilities) "
+            "for each segment. Implies detailed output."
         ),
     ),
 ):
@@ -312,13 +347,14 @@ async def transcribe(
 
     async with _transcribe_semaphore:
         acquired_ts = time.perf_counter()
-        transcription, meta = await asyncio.to_thread(
+        transcription, meta, segments = await asyncio.to_thread(
             _process_audio_bytes,
             data,
             file.content_type or "",
             file.filename or "",
             initial_prompt,
             no_speech_threshold,
+            bool(word_timestamps),
         )
     end_ts = time.perf_counter()
 
@@ -354,7 +390,51 @@ async def transcribe(
         text_preview,
     )
 
-    return {"transcription": transcription}
+    # Backwards-compatible default: simple response with just the transcription.
+    if not detailed and not word_timestamps:
+        return {"transcription": transcription}
+
+    # Build rich response with metadata, segments, and optional per-word confidences.
+    response = {
+        "transcription": transcription,
+        "language": lang,
+        "language_probability": lang_p,
+        "audio_seconds": audio_seconds,
+        "pipeline": pipeline,
+        "ffmpeg_used": ffmpeg_used,
+        "timing": {
+            "total": total,
+            "read": read_time,
+            "wait": wait_time,
+            "process": proc_time,
+            "model": meta_proc,
+        },
+    }
+
+    segments_out = []
+    for seg in segments:
+        seg_obj = {
+            "id": getattr(seg, "id", None),
+            "start": seg.start,
+            "end": seg.end,
+            "text": seg.text,
+            "avg_logprob": getattr(seg, "avg_logprob", None),
+            "no_speech_prob": getattr(seg, "no_speech_prob", None),
+        }
+        if word_timestamps and getattr(seg, "words", None) is not None:
+            seg_obj["words"] = [
+                {
+                    "start": w.start,
+                    "end": w.end,
+                    "word": w.word,
+                    "probability": getattr(w, "probability", None),
+                }
+                for w in seg.words
+            ]
+        segments_out.append(seg_obj)
+
+    response["segments"] = segments_out
+    return response
 
 
 if __name__ == "__main__":

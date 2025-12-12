@@ -16,12 +16,13 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["1"]
+              device_ids: ["0"]
               capabilities: [gpu]
     environment:
       # Ensure faster-whisper uses GPU if available
-      - NVIDIA_VISIBLE_DEVICES=1
+      - NVIDIA_VISIBLE_DEVICES=0
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - TRANSCRIBE_GPU_ID=0
       - TRANSCRIBE_WORKERS=4
       - TRANSCRIBE_PORT=8123
     command: >
